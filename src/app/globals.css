@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0b0b0c;
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  @apply bg-gray-50 text-gray-900;
+}
+video {
+  transform: scaleX(-1); /* mirror back camera for easier framing; comment out if undesired */
+}
+.overlay-dashed {
+  border-style: dashed;
+}
+.sensor-chip {
+  @apply text-xs px-2 py-1 rounded-full font-medium;
+}
+.countdown-overlay {
+  @apply absolute inset-0 flex items-center justify-center bg-black/50 text-white text-5xl font-bold;
+}
+.capture-toast {
+  @apply absolute bottom-24 left-1/2 -translate-x-1/2 bg-black/70 text-white px-3 py-1 rounded;
+}
