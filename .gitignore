@@ -1,17 +1,8 @@
-# dependencies
 node_modules/
-
-# next.js
 .next/
 out/
-
-# env & local
-.env*
+dist/
+*.log
+.env.local
+.env
 .DS_Store
-.vercel/
-npm-debug.log*
-yarn-*.log
-
-# bundles/archives
-*.zip
-*.tgz
