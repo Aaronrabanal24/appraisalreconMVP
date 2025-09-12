@@ -11,11 +11,13 @@
     "pages:preview": "npx wrangler pages dev .vercel/output/static --compatibility-date=2024-04-02"
   },
   "dependencies": {
+    "@tensorflow-models/coco-ssd": "^2.2.3",
+    "@tensorflow/tfjs": "^4.22.0",
+    "classnames": "2.5.1",
+    "lucide-react": "0.454.0",
     "next": "14.2.5",
     "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "lucide-react": "0.454.0",
-    "classnames": "2.5.1"
+    "react-dom": "18.2.0"
   },
   "devDependencies": {
     "@types/node": "20.12.12",
