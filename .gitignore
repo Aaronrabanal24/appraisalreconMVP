@@ -1,3 +1,7 @@
+# Next & deps
+.next/
+node_modules/
+.vercel/
 node_modules/
 .next/
 out/
@@ -13,3 +17,4 @@ dist/
 *.log
 .env*
 .DS_Store
+
