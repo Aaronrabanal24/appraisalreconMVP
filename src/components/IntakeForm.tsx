@@ -1,184 +1,225 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 
-type DealType = "lease_buyout" | "trade_in" | "sell_outright";
+type DealType = "lease" | "trade" | "sell";
+
+type IntakeDraft = {
+  vin: string;
+  stock?: string;
+  mileage: string; // keep as string for input control
+  dealType: DealType | "";
+};
+
+const VIN_HELP =
+  "Enter the 17-character VIN (I, O, Q are not used). You can paste and we'll format it.";
+
+const VIN_OK = (vin: string) => /^[A-HJ-NPR-Z0-9]{17}$/i.test(vin.trim());
+const MILES_OK = (m: string) => /^\d{1,7}$/.test(m.trim()); // up to 7 digits
 
 export default function IntakeForm() {
   const router = useRouter();
 
-  const [vin, setVin] = useState("");
-  const [stock, setStock] = useState("");
-  const [mileage, setMileage] = useState("");
-  const [dealType, setDealType] = useState<DealType | "">("");
+  const [draft, setDraft] = useState<IntakeDraft>({
+    vin: "",
+    stock: "",
+    mileage: "",
+    dealType: "",
+  });
 
-  // restore draft (optional)
+  // Restore any existing draft
   useEffect(() => {
     try {
       const raw = localStorage.getItem("intakeDraft");
       if (raw) {
-        const d = JSON.parse(raw);
-        if (d?.vin) setVin(String(d.vin));
-        if (d?.stock) setStock(String(d.stock));
-        if (d?.mileage) setMileage(String(d.mileage));
-        if (d?.dealType) setDealType(d.dealType);
+        const d = JSON.parse(raw) as IntakeDraft;
+        setDraft({
+          vin: d.vin || "",
+          stock: d.stock || "",
+          mileage: d.mileage || "",
+          dealType: d.dealType || "",
+        });
       }
     } catch {}
   }, []);
 
-  // persist draft
+  // Persist draft
   useEffect(() => {
-    const draft = { vin, stock, mileage, dealType };
     try {
       localStorage.setItem("intakeDraft", JSON.stringify(draft));
     } catch {}
-  }, [vin, stock, mileage, dealType]);
+  }, [draft]);
 
-  // helpers
-  const cleanVIN = (v: string) =>
-    v.toUpperCase().replace(/[^A-HJ-NPR-Z0-9]/g, ""); // exclude I,O,Q
+  const vinClean = useMemo(
+    () =>
+      draft.vin
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "")
+        .replace(/[IOQ]/g, ""), // strip forbidden VIN chars
+    [draft.vin]
+  );
 
-  const vinValid = useMemo(() => cleanVIN(vin).length === 17, [vin]);
-  const milesNum = useMemo(() => Number((mileage || "").replace(/[^\d]/g, "")), [mileage]);
-  const mileageValid = Number.isFinite(milesNum) && milesNum > 0;
-  const dealTypeValid = !!dealType;
+  const isValid = VIN_OK(vinClean) && MILES_OK(draft.mileage) && !!draft.dealType;
 
-  const canContinue = vinValid && mileageValid && dealTypeValid;
+  function selectDeal(t: DealType) {
+    setDraft((d) => ({ ...d, dealType: t }));
+  }
 
-  const onSubmit = (e: React.FormEvent) => {
+  function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!canContinue) return;
+    if (!isValid) return;
 
-    const intake = {
-      vin: cleanVIN(vin),
-      stock: stock.trim(),
-      mileage: milesNum,
-      dealType,
-      ts: Date.now(),
+    const payload = {
+      vin: vinClean,
+      stock: (draft.stock || "").trim(),
+      mileage: parseInt(draft.mileage, 10),
+      dealType: draft.dealType,
+      createdAt: Date.now(),
     };
 
     try {
-      localStorage.setItem("currentIntake", JSON.stringify(intake));
+      localStorage.setItem("intakeFinal", JSON.stringify(payload));
+      // optionally clear the draft
+      // localStorage.removeItem("intakeDraft");
     } catch {}
 
-    // Where to send next (capture page)
-    const nextRoute =
-      process.env.NEXT_PUBLIC_CAPTURE_ROUTE || "/capture";
-
-    router.push(nextRoute);
-  };
+    router.push("/capture"); // where your photo flow starts
+  }
 
   return (
-    <form onSubmit={onSubmit} className="mx-auto w-full max-w-xl rounded-xl border bg-white p-5 shadow-sm">
-      <div className="mb-4 flex items-center justify-between">
-        <h1 className="text-xl font-semibold">Deal Intake</h1>
-        <span className="text-xs text-gray-500">Step 1 of 2</span>
-      </div>
+    <form onSubmit={onSubmit} className="max-w-xl w-full mx-auto p-4">
+      <h1 className="text-2xl font-semibold mb-1">Deal Intake</h1>
+      <p className="text-sm text-gray-600 mb-6">
+        Capture the essentials before photos. You can edit later if needed.
+      </p>
 
       {/* VIN */}
-      <label className="block text-sm font-medium mb-1" htmlFor="vin">VIN</label>
+      <label htmlFor="vin" className="block text-sm font-medium mb-1">
+        VIN <span className="text-red-600">*</span>
+      </label>
       <input
         id="vin"
         inputMode="text"
         autoCapitalize="characters"
-        value={vin}
-        onChange={(e) => setVin(cleanVIN(e.target.value))}
-        placeholder="17-character VIN"
-        className="w-full border rounded px-3 py-2 mb-1 tracking-widest"
-        maxLength={17}
+        autoCorrect="off"
+        spellCheck={false}
+        value={draft.vin}
+        onChange={(e) => setDraft((d) => ({ ...d, vin: e.target.value }))}
+        className="w-full border rounded px-3 py-2 mb-1"
+        placeholder="1HGBH41JXMN109186"
+        aria-describedby="vinHelp"
       />
-      <p className="text-xs mb-3">
-        VIN must be 17 characters. Letters I, O, Q are not valid.
-        {!vinValid && vin.length > 0 && (
-          <span className="ml-2 text-red-600 font-medium">({17 - cleanVIN(vin).length} to go)</span>
-        )}
+      <p id="vinHelp" className="text-xs text-gray-600 mb-4">
+        {VIN_HELP}
       </p>
+      {!VIN_OK(vinClean) && draft.vin.length > 0 && (
+        <p className="text-xs text-red-600 -mt-3 mb-4">VIN should be 17 valid characters.</p>
+      )}
 
       {/* Stock (optional) */}
-      <label className="block text-sm font-medium mb-1" htmlFor="stock">Stock # (optional)</label>
+      <label htmlFor="stock" className="block text-sm font-medium mb-1">
+        Stock # <span className="text-gray-500">(optional)</span>
+      </label>
       <input
         id="stock"
-        value={stock}
-        onChange={(e) => setStock(e.target.value)}
-        placeholder="e.g., A12345"
-        className="w-full border rounded px-3 py-2 mb-3"
+        inputMode="text"
+        value={draft.stock}
+        onChange={(e) => setDraft((d) => ({ ...d, stock: e.target.value }))}
+        className="w-full border rounded px-3 py-2 mb-4"
+        placeholder="e.g., A1234"
       />
 
       {/* Mileage */}
-      <label className="block text-sm font-medium mb-1" htmlFor="mileage">Mileage</label>
-      <div className="relative mb-1">
-        <input
-          id="mileage"
-          inputMode="numeric"
-          value={mileage}
-          onChange={(e) => setMileage(e.target.value.replace(/[^\d]/g, ""))}
-          placeholder="e.g., 45210"
-          className="w-full border rounded px-3 py-2 pr-14"
-        />
-        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-gray-500">miles</span>
-      </div>
-      {!mileageValid && mileage.length > 0 && (
-        <p className="text-xs text-red-600 mb-3">Enter a mileage greater than 0.</p>
-      )}
-      {mileageValid && (
-        <p className="text-xs text-gray-600 mb-3">Recorded: {milesNum.toLocaleString()} miles</p>
+      <label htmlFor="mileage" className="block text-sm font-medium mb-1">
+        Mileage <span className="text-red-600">*</span>
+      </label>
+      <input
+        id="mileage"
+        inputMode="numeric"
+        value={draft.mileage}
+        onChange={(e) =>
+          setDraft((d) => ({ ...d, mileage: e.target.value.replace(/[^\d]/g, "") }))
+        }
+        className="w-full border rounded px-3 py-2 mb-1"
+        placeholder="e.g., 45678"
+      />
+      {!MILES_OK(draft.mileage) && draft.mileage.length > 0 && (
+        <p className="text-xs text-red-600 -mt-3 mb-4">Enter whole miles (digits only).</p>
       )}
 
       {/* Deal Type */}
-      <fieldset className="mb-4">
-        <legend className="block text-sm font-medium mb-2">Deal Type</legend>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-          <label className={`border rounded-lg px-3 py-2 cursor-pointer ${dealType === "lease_buyout" ? "ring-2 ring-black" : ""}`}>
-            <input
-              type="radio"
-              name="dealType"
-              className="sr-only"
-              checked={dealType === "lease_buyout"}
-              onChange={() => setDealType("lease_buyout")}
-            />
-            Lease
-          </label>
+      <fieldset className="mt-4">
+        <legend className="block text-sm font-medium mb-2">
+          Deal Type <span className="text-red-600">*</span>
+        </legend>
 
-          <label className={`border rounded-lg px-3 py-2 cursor-pointer ${dealType === "trade_in" ? "ring-2 ring-black" : ""}`}>
-            <input
-              type="radio"
-              name="dealType"
-              className="sr-only"
-              checked={dealType === "trade_in"}
-              onChange={() => setDealType("trade_in")}
-            />
-            Trade-in
-          </label>
-
-          <label className={`border rounded-lg px-3 py-2 cursor-pointer ${dealType === "sell_outright" ? "ring-2 ring-black" : ""}`}>
-            <input
-              type="radio"
-              name="dealType"
-              className="sr-only"
-              checked={dealType === "sell_outright"}
-              onChange={() => setDealType("sell_outright")}
-            />
-            Sell outright
-          </label>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <DealCard
+            label="Lease"
+            selected={draft.dealType === "lease"}
+            onClick={() => selectDeal("lease")}
+          />
+          <DealCard
+            label="Trade-in"
+            selected={draft.dealType === "trade"}
+            onClick={() => selectDeal("trade")}
+          />
+          <DealCard
+            label="Sell outright"
+            selected={draft.dealType === "sell"}
+            onClick={() => selectDeal("sell")}
+          />
         </div>
-        {!dealTypeValid && <p className="text-xs text-red-600 mt-2">Choose a deal type.</p>}
       </fieldset>
 
       {/* Actions */}
-      <div className="mt-5 flex items-center justify-between">
-        <p className="text-xs text-gray-500">
-          You’ll review and take photos on the next step.
-        </p>
+      <div className="mt-6 flex items-center gap-3">
         <button
           type="submit"
-          disabled={!canContinue}
-          className={`rounded-lg px-4 py-2 text-white ${canContinue ? "bg-black" : "bg-gray-400 cursor-not-allowed"}`}
-          aria-disabled={!canContinue}
+          disabled={!isValid}
+          className={`inline-flex items-center justify-center rounded-lg px-4 py-2 text-white ${
+            isValid ? "bg-black hover:opacity-90" : "bg-gray-300 cursor-not-allowed"
+          }`}
         >
-          Continue to Photos
+          Save & Continue
         </button>
+
+        <span className="text-xs text-gray-500">
+          VIN preview: <code className="font-mono">{vinClean || "—"}</code>
+        </span>
       </div>
     </form>
+  );
+}
+
+function DealCard({
+  label,
+  selected,
+  onClick,
+}: {
+  label: string;
+  selected: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={selected}
+      className={`w-full rounded-lg border p-3 text-left transition ${
+        selected ? "border-black ring-2 ring-black" : "hover:bg-gray-50"
+      }`}
+    >
+      <div className="flex items-center justify-between">
+        <span className="font-medium">{label}</span>
+        <span
+          className={`h-4 w-4 rounded-full border ${
+            selected ? "bg-black border-black" : "bg-white"
+          }`}
+          aria-hidden
+        />
+      </div>
+    </button>
   );
 }
