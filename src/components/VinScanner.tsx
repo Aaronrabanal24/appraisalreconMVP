@@ -1,130 +1,137 @@
-"use client";
+'use client';
 
-import { useEffect, useRef, useState } from "react";
-import { isLikelyVIN, normalizeVIN } from "@/lib/vin";
+import { useEffect, useRef, useState } from 'react';
 
 type Props = {
   onDetected: (vin: string) => void;
 };
 
+function isLikelyVIN(s: string) {
+  const v = s.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+  return v.length === 17 && !/[IOQ]/.test(v);
+}
+
 export default function VinScanner({ onDetected }: Props) {
-  const enabled = process.env.NEXT_PUBLIC_ENABLE_VIN_SCAN === "true";
+  const hostRef = useRef<HTMLDivElement | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [running, setRunning] = useState(false);
-  const boxRef = useRef<HTMLDivElement>(null);
   const stopRef = useRef<() => Promise<void> | void>(() => {});
 
   useEffect(() => {
-    if (!enabled) return;
     let cancelled = false;
 
-    (async () => {
-      // Prefer native BarcodeDetector if available
-      // @ts-ignore
-      if (globalThis.BarcodeDetector) {
-        try {
-          // @ts-ignore
-          const detector = new BarcodeDetector({ formats: ["code_39", "code_128", "code_93"] });
-          const video = document.createElement("video");
+    async function start() {
+      // 1) Try native BarcodeDetector
+      try {
+        // @ts-ignore
+        const BD = (window as any).BarcodeDetector;
+        if (BD && Array.isArray(BD.getSupportedFormats)) {
+          const supported = await BD.getSupportedFormats();
+          const ok = supported.some((f: string) =>
+            ['code_39', 'code_128', 'code_93', 'qr_code'].includes(f?.toLowerCase?.())
+          );
+
+          const video = document.createElement('video');
           video.playsInline = true;
           video.muted = true;
           video.autoplay = true;
-          const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-          video.srcObject = stream;
-          boxRef.current?.replaceChildren(video);
-          setRunning(true);
+          video.style.width = '100%';
+          video.style.maxWidth = '480px';
+          video.style.borderRadius = '12px';
+          video.style.background = '#000';
 
+          if (!hostRef.current) return;
+          hostRef.current.innerHTML = '';
+          hostRef.current.appendChild(video);
+
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+          });
+          video.srcObject = stream;
+
+          const detector = new BD({ formats: ok ? ['code_39', 'code_128', 'code_93', 'qr_code'] : undefined });
           let raf = 0;
+
           const tick = async () => {
-            if (!video.videoWidth) { raf = requestAnimationFrame(tick); return; }
+            if (cancelled) return;
             try {
-              const bitmaps = [await createImageBitmap(video)];
-              const codes = await detector.detect(bitmaps[0] as any);
-              for (const c of codes) {
-                const raw = String(c.rawValue || "");
-                const vin = normalizeVIN(raw);
-                if (isLikelyVIN(vin)) {
-                  stopRef.current = () => stream.getTracks().forEach(t => t.stop());
-                  stream.getTracks().forEach(t => t.stop());
-                  setRunning(false);
-                  onDetected(vin);
-                  return;
+              if (video.readyState >= 2) {
+                const bitmap = await createImageBitmap(video);
+                const codes = await detector.detect(bitmap);
+                bitmap.close();
+                const text = codes?.[0]?.rawValue as string | undefined;
+                if (text && isLikelyVIN(text)) {
+                  onDetected(text.replace(/[^A-Z0-9]/gi, '').toUpperCase());
+                  return; // stop after first good VIN
                 }
               }
-            } catch {}
+            } catch {/* ignore per frame */}
             raf = requestAnimationFrame(tick);
           };
           raf = requestAnimationFrame(tick);
-          stopRef.current = () => { cancelAnimationFrame(raf); stream.getTracks().forEach(t => t.stop()); };
-          return;
-        } catch (e:any) {
-          setErr(e?.message || "BarcodeDetector failed; falling back.");
+
+          stopRef.current = async () => {
+            cancelAnimationFrame(raf);
+            stream.getTracks().forEach(t => t.stop());
+          };
+          return; // success path
         }
+      } catch {
+        /* fall through to html5-qrcode */
       }
 
-      // Fallback: html5-qrcode (supports CODE_39 in new versions)
+      // 2) Fallback: Html5QrcodeScanner (formatsToSupport valid here)
       try {
-        const { Html5Qrcode, Html5QrcodeSupportedFormats } = await import("html5-qrcode");
-        const id = "vin-scan-box";
-        if (!boxRef.current) return;
-        const mount = document.createElement("div");
-        mount.id = id;
-        mount.style.width = "100%";
-        mount.style.maxWidth = "420px";
-        mount.style.aspectRatio = "4/3";
-        mount.style.background = "#000";
-        boxRef.current.replaceChildren(mount);
+        const { Html5QrcodeScanner, Html5QrcodeSupportedFormats, Html5QrcodeScanType } = await import('html5-qrcode');
+        const containerId = 'vin-scanner-host';
 
-        const scanner = new Html5Qrcode(id);
-        setRunning(true);
-        await scanner.start(
-          { facingMode: "environment" },
+        if (!hostRef.current) return;
+        hostRef.current.innerHTML = `<div id="${containerId}"></div>`;
+
+        const scanner = new Html5QrcodeScanner(
+          containerId,
           {
             fps: 12,
-            qrbox: { width: 280, height: 120 }, // VIN strip
+            qrbox: { width: 280, height: 120 },
+            rememberLastUsedCamera: true,
+            supportedScanTypes: [Html5QrcodeScanType.SCAN_TYPE_CAMERA],
             formatsToSupport: [
               Html5QrcodeSupportedFormats.CODE_39,
               Html5QrcodeSupportedFormats.CODE_128,
               Html5QrcodeSupportedFormats.CODE_93,
+              Html5QrcodeSupportedFormats.QR_CODE,
             ],
           },
-          (decoded: string) => {
-            const vin = normalizeVIN(decoded);
-            if (isLikelyVIN(vin)) {
-              scanner.stop().catch(() => {});
-              setRunning(false);
-              onDetected(vin);
-            }
-          },
-          () => {}
+          /* verbose */ false
         );
 
-        stopRef.current = () => scanner.stop();
-      } catch (e:any) {
-        setErr(e?.message || "Camera scan not available on this device.");
-      }
-    })();
+        const onSuccess = (decodedText: string) => {
+          const t = (decodedText || '').toUpperCase();
+          if (isLikelyVIN(t)) {
+            onDetected(t.replace(/[^A-Z0-9]/g, ''));
+            scanner.clear().catch(() => {});
+          }
+        };
 
+        scanner.render(onSuccess, /* onError */ () => {});
+        stopRef.current = () => scanner.clear();
+      } catch (e) {
+        if (!cancelled) setErr('Camera scanner unavailable. Enter VIN manually.');
+      }
+    }
+
+    start();
     return () => {
-      if (!cancelled) {
-        try { stopRef.current?.(); } catch {}
-      }
       cancelled = true;
+      try { const s = stopRef.current; s && s(); } catch { /* noop */ }
     };
-  }, [enabled, onDetected]);
-
-  if (!enabled) {
-    return <p className="text-sm text-gray-600">VIN scan disabled. Enable with <code>NEXT_PUBLIC_ENABLE_VIN_SCAN=true</code>.</p>;
-  }
+  }, [onDetected]);
 
   return (
     <div className="space-y-2">
-      <div ref={boxRef} className="rounded-lg overflow-hidden border bg-black/80" />
-      <div className="text-xs text-gray-500">
-        {running ? "Point camera at the VIN barcode near the windshield (Code 39)." :
-         err ? `Scanner inactive: ${err}` :
-         "Scanner ready."}
-      </div>
+      <div ref={hostRef} />
+      {err && <p className="text-sm text-red-600">{err}</p>}
+      <p className="text-xs text-gray-500">Tip: Aim at the VIN barcode (windshield/A-pillar or door jamb).</p>
     </div>
   );
 }
