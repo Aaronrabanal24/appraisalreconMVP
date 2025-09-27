@@ -1,6 +1,4 @@
-// src/components/AcvCalculator.tsx
 "use client";
-
 import { useMemo, useState, useEffect } from "react";
 import { calcAppraisal } from "@/lib/calc";
 
@@ -56,9 +54,7 @@ export default function AcvCalculator() {
 
       <div className="flex items-center justify-between border-t pt-3">
         <span className="text-sm text-gray-700">Max Offer</span>
-        <span className="text-xl font-bold tabular-nums">
-          ${maxOffer.toLocaleString()}
-        </span>
+        <span className="text-xl font-bold tabular-nums">${maxOffer.toLocaleString()}</span>
       </div>
     </div>
   );

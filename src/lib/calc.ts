@@ -1,5 +1,4 @@
-// src/lib/calc.ts
-export type AppraisalInput = { 
+export type AppraisalInput = {
   acv: number;      // market value before recon
   recon: number;    // total recon estimate
 };

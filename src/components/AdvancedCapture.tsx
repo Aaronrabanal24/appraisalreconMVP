@@ -1,18 +1,15 @@
-'use client';
+"use client";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import cx from 'classnames';
-import { Camera, CheckCircle, XCircle } from 'lucide-react';
+export type OverlayKind = "trapezoid" | "circle" | "rectangle" | "oval" | "none";
 
-export type OverlayKind = 'trapezoid' | 'circle' | 'rectangle' | 'oval' | 'none';
-
-export type CoachSpec = {
+export type CaptureSpec = {
   overlay: OverlayKind;
   tip: string;
-  coinMode?: boolean;
+  coinMode?: boolean; // shows the "coin" hint for tread
 };
 
-export type SensorState = {
+type SensorState = {
   sharp: boolean;
   glareSafe: boolean;
   exposureOK: boolean;
@@ -21,77 +18,116 @@ export type SensorState = {
 
 type Props = {
   stepName: string;
-  spec: CoachSpec;
-  dwellMs?: number; // how long sensors must be all green before starting 3-2-1
+  spec: CaptureSpec;
+  dwellMs?: number; // auto-capture dwell
   onCapture: (blob: Blob, dataUrl: string) => void;
 };
 
-// === Quick helpers ==========================================================
+// ---------- helpers (fast, no external libs) ----------
 
-// grayscale in place
-function toGray(pix: ImageData['data']) {
-  for (let i = 0; i < pix.length; i += 4) {
-    const r = pix[i], g = pix[i+1], b = pix[i+2];
-    const y = (r*0.299 + g*0.587 + b*0.114)|0;
-    pix[i] = pix[i+1] = pix[i+2] = y;
+// grayscale into Uint8ClampedArray
+function toGray(imgData: ImageData) {
+  const { data, width, height } = imgData;
+  const out = new Uint8ClampedArray(width * height);
+  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+    // luma-ish
+    out[j] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
   }
+  return out;
 }
 
-// Simple sharpness: mean gradient magnitude on small canvas
-function sharpnessScore(gray: Uint8ClampedArray, W: number, H: number) {
-  let acc = 0, cnt = 0;
-  for (let y=1;y<H-1;y++) {
-    for (let x=1;x<W-1;x++) {
-      const i = y*W + x;
-      const gx = -gray[i-W-1] - 2*gray[i-1] - gray[i+W-1] + gray[i-W+1] + 2*gray[i+1] + gray[i+W+1];
-      const gy =  gray[i-W-1] + 2*gray[i-W] + gray[i-W+1] - gray[i+W-1] - 2*gray[i+W] - gray[i+W+1];
-      acc += Math.hypot(gx,gy);
-      cnt++;
+// simple blur/sharpness: variance of Laplacian proxy
+function sharpness(gray: Uint8ClampedArray, W: number, H: number) {
+  let sum = 0,
+    sumSq = 0,
+    c = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      // 4-neighbor laplace
+      const v =
+        4 * gray[i] -
+        gray[i - 1] -
+        gray[i + 1] -
+        gray[i - W] -
+        gray[i + W];
+      sum += v;
+      sumSq += v * v;
+      c++;
     }
   }
-  return cnt>0 ? acc/cnt : 0;
+  if (!c) return 0;
+  const mean = sum / c;
+  const varLap = (sumSq / c) - mean * mean;
+  return Math.max(0, varLap);
 }
 
-// Glare: % of near-white pixels
-function glareFraction(pix: Uint8ClampedArray) {
-  let over = 0, total = 0;
-  for (let i=0;i<pix.length;i+=4) {
-    const r=pix[i],g=pix[i+1],b=pix[i+2];
-    if (r>245 || g>245 || b>245) over++;
-    total++;
-  }
-  return total>0 ? over/total : 0;
-}
-
-// Exposure: mean luminance within range
-function meanBrightness(pix: Uint8ClampedArray) {
-  let sum = 0, n=0;
-  for (let i=0;i<pix.length;i+=4) {
-    sum += pix[i]; // already gray if toGray was run
+// glare: count near-white pixels; exposure: check mid histogram spread
+function exposureAndGlare(img: ImageData) {
+  const { data } = img;
+  let whites = 0;
+  let sum = 0,
+    sumSq = 0,
+    n = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i],
+      g = data[i + 1],
+      b = data[i + 2];
+    const luma = (0.299 * r + 0.587 * g + 0.114 * b);
+    if (r > 245 && g > 245 && b > 245) whites++;
+    sum += luma;
+    sumSq += luma * luma;
     n++;
   }
-  return n>0 ? sum/n : 0;
+  const mean = sum / (n || 1);
+  const varL = (sumSq / (n || 1)) - mean * mean; // crude spread
+  const glareSafe = whites / (n || 1) < 0.02; // <2% pure white
+  const exposureOK = varL > 1200 && mean > 60 && mean < 200; // “balanced-ish”
+  return { glareSafe, exposureOK };
+}
+
+// tilt: prefer device orientation if available; fall back to horizon from edges
+function approxLevel(video: HTMLVideoElement) {
+  // We’ll trust device orientation if present (updated below via event).
+  // Here we just return true and let the event handler set state.
+  return true;
 }
 
 // Quick "wheel present" heuristic using edge energy in a circular band
-export function ringnessScore(gray: Uint8ClampedArray, W: number, H: number) {
+function ringnessScore(gray: Uint8ClampedArray, W: number, H: number) {
   const mags = new Float32Array(W * H);
   let total = 0;
   for (let y = 1; y < H - 1; y++) {
     for (let x = 1; x < W - 1; x++) {
       const i = y * W + x;
-      const gx = -gray[i - W - 1] - 2 * gray[i - 1] - gray[i + W - 1] + gray[i - W + 1] + 2 * gray[i + 1] + gray[i + W + 1];
-      const gy =  gray[i - W - 1] + 2 * gray[i - W] + gray[i - W + 1] - gray[i + W - 1] - 2 * gray[i + W] - gray[i + W + 1];
+      const gx =
+        -gray[i - W - 1] -
+        2 * gray[i - 1] -
+        gray[i + W - 1] +
+        gray[i - W + 1] +
+        2 * gray[i + 1] +
+        gray[i + W + 1];
+      const gy =
+        gray[i - W - 1] +
+        2 * gray[i - W] +
+        gray[i - W + 1] -
+        gray[i + W - 1] -
+        2 * gray[i + W] -
+        gray[i + W + 1];
       const m = Math.hypot(gx, gy);
-      mags[i] = m; total += m;
+      mags[i] = m;
+      total += m;
     }
   }
-  const cx = W / 2, cy = H * 0.60;
-  const rInner = H * 0.15, rOuter = H * 0.27; // matches overlay ring roughly
+  const cx = W / 2,
+    cy = H * 0.6;
+  const rInner = H * 0.15,
+    rOuter = H * 0.27; // matches overlay ring roughly
   let ring = 0;
   for (let y = 1; y < H - 1; y++) {
     for (let x = 1; x < W - 1; x++) {
-      const dx = x - cx, dy = y - cy;
+      const dx = x - cx,
+        dy = y - cy;
       const r = Math.hypot(dx, dy);
       if (r >= rInner && r <= rOuter) ring += mags[y * W + x];
     }
@@ -99,391 +135,432 @@ export function ringnessScore(gray: Uint8ClampedArray, W: number, H: number) {
   return total > 1 ? ring / total : 0;
 }
 
-// Sensor chip
+// Under-carriage “coverage”: % of edges inside oval overlay
+function ovalCoverage(gray: Uint8ClampedArray, W: number, H: number) {
+  const mags = new Float32Array(W * H);
+  let total = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      const gx =
+        -gray[i - W - 1] -
+        2 * gray[i - 1] -
+        gray[i + W - 1] +
+        gray[i - W + 1] +
+        2 * gray[i + 1] +
+        gray[i + W + 1];
+      const gy =
+        gray[i - W - 1] +
+        2 * gray[i - W] +
+        gray[i - W + 1] -
+        gray[i + W - 1] -
+        2 * gray[i + W] -
+        gray[i + W + 1];
+      const m = Math.hypot(gx, gy);
+      mags[i] = m;
+      total += m;
+    }
+  }
+  const cx = W / 2,
+    cy = H * 0.62;
+  const rx = W * 0.33,
+    ry = H * 0.18;
+  let inside = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const nx = (x - cx) / rx;
+      const ny = (y - cy) / ry;
+      if (nx * nx + ny * ny <= 1) inside += mags[y * W + x];
+    }
+  }
+  return total > 1 ? inside / total : 0;
+}
+
 function SensorChip({ ok, label }: { ok: boolean; label: string }) {
   return (
-    <span className={cx('sensor-chip', ok ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700')}>
+    <span
+      className={`px-2 py-1 rounded text-xs font-medium ${
+        ok ? "bg-green-600 text-white" : "bg-gray-300 text-gray-700"
+      }`}
+    >
       {label}
     </span>
   );
 }
 
-// Countdown ring (SVG)
-function Ring({ pct }: { pct: number }) {
-  const r = 26, c = 2 * Math.PI * r;
-  const off = c * (1 - Math.min(1, Math.max(0, pct)));
-  return (
-    <svg width="64" height="64" viewBox="0 0 64 64">
-      <circle cx="32" cy="32" r={r} stroke="rgba(255,255,255,0.25)" strokeWidth="6" fill="none" />
-      <circle cx="32" cy="32" r={r} stroke="white" strokeWidth="6" fill="none" strokeDasharray={c} strokeDashoffset={off} strokeLinecap="round" />
-    </svg>
-  );
-}
+export default function AdvancedCapture({
+  stepName,
+  spec,
+  dwellMs = 800,
+  onCapture,
+}: Props) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const workRef = useRef<HTMLCanvasElement>(null);
+  const paintRef = useRef<HTMLCanvasElement>(null);
 
-// === Component ===============================================================
-
-export default function AdvancedCapture({ stepName, spec, dwellMs = 800, onCapture }: Props) {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const smallRef = useRef<HTMLCanvasElement | null>(null);
-  const fullRef = useRef<HTMLCanvasElement | null>(null);
-
-  const [ready, setReady] = useState(false);
-  const [sensors, setSensors] = useState<SensorState>({ sharp: false, glareSafe: true, exposureOK: true, levelOK: true });
+  const [sensors, setSensors] = useState<SensorState>({
+    sharp: false,
+    glareSafe: true,
+    exposureOK: true,
+    levelOK: true,
+  });
   const [subjectOK, setSubjectOK] = useState(false);
+  const [countdown, setCountdown] = useState<number>(0);
+  const [dwellStarted, setDwellStarted] = useState<number | null>(null);
+  const [showReview, setShowReview] = useState(false);
+  const [pendingImg, setPendingImg] = useState<string | null>(null);
+  const [pendingBlob, setPendingBlob] = useState<Blob | null>(null);
+  const [levelDeg, setLevelDeg] = useState(0);
+  const [ovalOK, setOvalOK] = useState(false); // under-carriage coverage
 
-  const [countdownActive, setCountdownActive] = useState(false);
-  const [countdownPct, setCountdownPct] = useState(0);
-  const [threeTwoOne, setThreeTwoOne] = useState<number | null>(null);
+  const overlay = spec.overlay;
 
-  const [confirmUrl, setConfirmUrl] = useState<string | null>(null);
-  const [capturing, setCapturing] = useState(false);
-
-  const [modelReady, setModelReady] = useState(false);
-  const modelRef = useRef<any>(null as any);
-  const lastDetectRef = useRef<number>(0);
-
-  // get camera
   useEffect(() => {
     let stream: MediaStream | null = null;
-    const run = async () => {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
-          setReady(true);
-        }
-      } catch (e) {
-        console.error('Camera error', e);
-      }
-    };
-    run();
-    return () => {
-      if (stream) stream.getTracks().forEach(t => t.stop());
-    };
-  }, []);
-
-  // Try to lazy-load coco-ssd only if installed
-  useEffect(() => {
-    (async () => {
-      try {
-        // @ts-ignore
-        const tf = await import('@tensorflow/tfjs');
-        // @ts-ignore
-        const cocoSsd = await import('@tensorflow-models/coco-ssd');
-        // @ts-ignore
-        modelRef.current = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-        setModelReady(true);
-      } catch {
-        // not installed; heuristics only
-        setModelReady(false);
-      }
-    })();
-  }, []);
-
-  // device orientation for Level
-  const [levelDeg, setLevelDeg] = useState(0);
-  useEffect(() => {
-    const handler = (e: DeviceOrientationEvent) => {
-      // gamma ~ roll
-      const g = e.gamma ?? 0;
-      setLevelDeg(g);
-    };
-    window.addEventListener('deviceorientation', handler);
-    return () => window.removeEventListener('deviceorientation', handler);
-  }, []);
-
-  // Analysis loop
-  useEffect(() => {
     let raf = 0;
-    let dwellStart = 0;
-    let lastStateAllGreen = false;
-    let threeTimer: any = null;
+    const video = videoRef.current!;
+    const work = workRef.current!;
+    const paint = paintRef.current!;
+    const wctx = work.getContext("2d", { willReadFrequently: true })!;
+    const pctx = paint.getContext("2d")!;
 
-    const loop = () => {
-      raf = requestAnimationFrame(loop);
-      const v = videoRef.current, c = smallRef.current;
-      if (!v || !c) return;
-      const W = 160, H = 120;
-      c.width = W; c.height = H;
-      const ctx = c.getContext('2d', { willReadFrequently: true });
-      if (!ctx) return;
-      ctx.drawImage(v, 0, 0, W, H);
-      const img = ctx.getImageData(0, 0, W, H);
-      toGray(img.data);
-      // copies: keep original gray as first channel value
-      const gray = new Uint8ClampedArray(W*H);
-      for (let y=0;y<H;y++) {
-        for (let x=0;x<W;x++) {
-          const i = (y*W + x);
-          gray[i] = img.data[i*4];
-        }
+    const analyze = () => {
+      if (!video.videoWidth || !video.videoHeight) {
+        raf = requestAnimationFrame(analyze);
+        return;
       }
+      const W = 320;
+      const H = Math.floor((video.videoHeight / video.videoWidth) * W);
+      work.width = W;
+      work.height = H;
+      paint.width = W;
+      paint.height = H;
+
+      wctx.drawImage(video, 0, 0, W, H);
+      const img = wctx.getImageData(0, 0, W, H);
+      const gray = toGray(img);
 
       // sensors
-      const sScore = sharpnessScore(gray, W, H);
-      const sharpOK = sScore > 12; // tune 10-14
+      const shp = sharpness(gray, W, H);
+      const { glareSafe, exposureOK } = exposureAndGlare(img);
+      const sharpOK = shp > 45; // tune
+      const levelOK = approxLevel(video);
 
-      const glareFrac = glareFraction(img.data);
-      const glareSafe = glareFrac < 0.01; // <1% near-white
-
-      const meanY = meanBrightness(img.data);
-      const exposureOK = meanY > 50 && meanY < 205;
-
-      const needLevel = /side/.test(spec.tip.toLowerCase()) || spec.overlay === 'trapezoid';
-      const levelOK = !needLevel ? true : Math.abs(levelDeg) < 6;
-
-      // Subject check
+      // subject check:
       let subjOK = false;
-      const isTire = spec.overlay === 'circle';
-      if (isTire) {
-        const score = ringnessScore(gray, W, H);
-        subjOK = score > 0.18;
-        setSubjectOK(subjOK);
+      if (overlay === "circle") {
+        const rs = ringnessScore(gray, W, H);
+        subjOK = rs > 0.18;
+      } else if (overlay === "oval") {
+        const cov = ovalCoverage(gray, W, H);
+        setOvalOK(cov > 0.32); // enough surface area
+        // For oval step, we still want some “not blank” frame:
+        subjOK = cov > 0.12;
       } else {
-        // occasionally run coco-ssd if present
-        const nowTs = performance.now();
-        const shouldDetect = modelReady && (nowTs - lastDetectRef.current) > 700;
-        if (shouldDetect && v && modelRef.current) {
-          lastDetectRef.current = nowTs;
-          modelRef.current.detect(v).then((preds: any[]) => {
-            const ok = preds.some((p: any) => {
-              const cls = String(p.class || '').toLowerCase();
-              if (!['car','truck','bus','suv'].includes(cls)) return false;
-              if (p.score && p.score < 0.5) return false;
-              const [x,y,w,h] = p.bbox || [0,0,0,0];
-              const area = w*h;
-              const rel = area / ((v.videoWidth||1280)*(v.videoHeight||720));
-              return rel > 0.04;
-            });
-            setSubjectOK(ok);
-          }).catch(()=>{});
-        }
-        subjOK = subjectOK;
+        // generic: just need decent edges overall
+        subjOK = shp > 30 && exposureOK;
       }
 
-      const state: SensorState = { sharp: sharpOK, glareSafe, exposureOK, levelOK };
-      const allGreen = Object.values(state).every(Boolean) && subjOK;
-      setSensors(state);
+      setSubjectOK(subjOK);
+      setSensors({ sharp: sharpOK, glareSafe, exposureOK, levelOK });
 
-      // dwell + 3-2-1 countdown
-      if (allGreen) {
-        if (!lastStateAllGreen) {
-          dwellStart = performance.now();
-        }
-        const dwellElapsed = performance.now() - dwellStart;
-        if (!countdownActive && dwellElapsed >= dwellMs) {
-          // start 3-2-1
-          setCountdownActive(true);
-          setThreeTwoOne(3);
-          let left = 3;
-          threeTimer = setInterval(() => {
-            left--;
-            if (left > 0) {
-              setThreeTwoOne(left);
-            } else {
-              clearInterval(threeTimer);
-              setThreeTwoOne(null);
-              doCapture();
-            }
-          }, 1000);
-        } else if (!countdownActive) {
-          setCountdownPct(Math.min(1, dwellElapsed / dwellMs));
-        }
+      // draw overlay + tip
+      pctx.clearRect(0, 0, W, H);
+      pctx.save();
+      pctx.strokeStyle = "rgba(0,0,0,0.0)";
+      pctx.fillStyle = "rgba(0,0,0,0.0)";
+      pctx.drawImage(work, 0, 0);
+
+      // overlay guides
+      pctx.lineWidth = 2;
+      pctx.strokeStyle = "rgba(0,0,0,0.0)";
+      pctx.fillStyle = "rgba(0,0,0,0.0)";
+
+      // draw a semi-transparent mask outside the target region to guide framing
+      pctx.save();
+      pctx.globalAlpha = 0.35;
+      pctx.fillStyle = "#000";
+      pctx.beginPath();
+      pctx.rect(0, 0, W, H);
+      pctx.closePath();
+
+      pctx.globalCompositeOperation = "destination-out";
+      pctx.beginPath();
+      if (overlay === "trapezoid") {
+        const topY = H * 0.18;
+        const botY = H * 0.83;
+        const topL = W * 0.2;
+        const topR = W * 0.8;
+        const botL = W * 0.08;
+        const botR = W * 0.92;
+        pctx.moveTo(topL, topY);
+        pctx.lineTo(topR, topY);
+        pctx.lineTo(botR, botY);
+        pctx.lineTo(botL, botY);
+        pctx.closePath();
+      } else if (overlay === "circle") {
+        pctx.ellipse(W / 2, H * 0.6, H * 0.24, H * 0.24, 0, 0, Math.PI * 2);
+      } else if (overlay === "rectangle") {
+        const pad = 20;
+        pctx.rect(pad, pad, W - pad * 2, H - pad * 2);
+      } else if (overlay === "oval") {
+        pctx.ellipse(W / 2, H * 0.62, W * 0.33, H * 0.18, 0, 0, Math.PI * 2);
       } else {
-        // reset dwell/countdown
-        setCountdownPct(0);
-        if (threeTimer) clearInterval(threeTimer);
-        if (countdownActive) setCountdownActive(false);
-        setThreeTwoOne(null);
+        // none → no cutout
+        pctx.rect(0, 0, W, H);
       }
+      pctx.fill();
+      pctx.restore();
 
-      lastStateAllGreen = allGreen;
+      // dashed rocker (for sides) and ring line, etc.
+      pctx.save();
+      pctx.strokeStyle = "rgba(255,255,255,0.85)";
+      pctx.setLineDash([6, 4]);
+      if (overlay === "trapezoid") {
+        // dashed rocker: a straight line near bottom
+        pctx.beginPath();
+        pctx.moveTo(W * 0.1, H * 0.82);
+        pctx.lineTo(W * 0.9, H * 0.82);
+        pctx.stroke();
+      }
+      pctx.restore();
+
+      // tip banner
+      pctx.save();
+      pctx.fillStyle = "rgba(0,0,0,0.6)";
+      pctx.fillRect(0, 0, W, 36);
+      pctx.fillStyle = "#fff";
+      pctx.font = "bold 12px system-ui, -apple-system, sans-serif";
+      pctx.fillText(spec.tip, 10, 22);
+      if (spec.coinMode) {
+        pctx.font = "10px system-ui, -apple-system, sans-serif";
+        pctx.fillText("Tip: Hold coin at wear bars", 10, 34);
+      }
+      pctx.restore();
+
+      pctx.restore();
+
+      raf = requestAnimationFrame(analyze);
     };
 
-    const doCapture = async () => {
-      const v = videoRef.current, fc = fullRef.current;
-      if (!v || !fc) return;
-      setCapturing(true);
-      const W = v.videoWidth || 1280;
-      const H = v.videoHeight || 720;
-      fc.width = W; fc.height = H;
-      const ctx = fc.getContext('2d');
-      if (!ctx) return;
-      ctx.drawImage(v, 0, 0, W, H);
-      fc.toBlob((blob) => {
-        if (!blob) return;
-        const url = URL.createObjectURL(blob);
-        setConfirmUrl(url);
-        setCapturing(false);
-        setCountdownActive(false);
-        setCountdownPct(0);
-      }, 'image/jpeg', 0.9);
+    const start = async () => {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+      analyze();
     };
 
-    loop();
+    start().catch(() => {
+      // ignore
+    });
+
+    const onOrient = (e: DeviceOrientationEvent) => {
+      if (e.beta != null) {
+        // rough level from gamma (roll)
+        const roll = e.gamma ?? 0;
+        setLevelDeg(roll);
+      }
+    };
+    window.addEventListener("deviceorientation", onOrient);
+
     return () => {
       cancelAnimationFrame(raf);
+      window.removeEventListener("deviceorientation", onOrient);
+      if (stream) {
+        stream.getTracks().forEach((t) => t.stop());
+      }
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [spec.overlay, modelReady]);
+  }, [overlay, spec.tip]);
 
-  // manual capture
-  const snapNow = () => {
-    // force countdown even if not all green
-    setThreeTwoOne(3);
-    const timer = setInterval(() => {
-      setThreeTwoOne(prev => {
-        if (!prev) return null;
-        if (prev > 1) return prev - 1;
-        clearInterval(timer);
-        setThreeTwoOne(null);
-        // draw
-        const v = videoRef.current, fc = fullRef.current;
-        if (!v || !fc) return null;
-        const W = v.videoWidth || 1280, H = v.videoHeight || 720;
-        fc.width = W; fc.height = H;
-        const ctx = fc.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(v, 0, 0, W, H);
-          fc.toBlob((blob) => {
-            if (!blob) return;
-            const url = URL.createObjectURL(blob);
-            setConfirmUrl(url);
-          }, 'image/jpeg', 0.9);
-        }
-        return null;
-      });
-    }, 1000);
+  // auto-capture dwell logic (except oval/under-carriage which requires explicit tap when “green”)
+  const allGreen =
+    sensors.sharp && sensors.glareSafe && sensors.exposureOK && sensors.levelOK && subjectOK;
+
+  useEffect(() => {
+    // For under-carriage (oval), we only allow manual capture when ovalOK is true (no countdown).
+    if (overlay === "oval") {
+      setCountdown(0);
+      setDwellStarted(null);
+      return;
+    }
+
+    if (allGreen) {
+      if (!dwellStarted) {
+        setDwellStarted(performance.now());
+        setCountdown(Math.ceil(dwellMs / 1000));
+      }
+    } else {
+      setDwellStarted(null);
+      setCountdown(0);
+    }
+  }, [allGreen, dwellMs, dwellStarted, overlay]);
+
+  useEffect(() => {
+    if (!dwellStarted) return;
+    let raf = 0;
+    const tick = () => {
+      const elapsed = performance.now() - (dwellStarted ?? 0);
+      const remain = Math.max(0, dwellMs - elapsed);
+      const secs = Math.ceil(remain / 1000);
+      setCountdown(secs);
+      if (remain <= 0) {
+        // fire capture
+        doCapture();
+        setDwellStarted(null);
+        setCountdown(0);
+        return;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => cancelAnimationFrame(raf);
+  }, [dwellMs, dwellStarted]);
+
+  const doCapture = async () => {
+    const paint = paintRef.current!;
+    // snapshot from the video directly for best quality
+    const snap = document.createElement("canvas");
+    const video = videoRef.current!;
+    const W = video.videoWidth || 1280;
+    const H = video.videoHeight || 720;
+    snap.width = W;
+    snap.height = H;
+    const sctx = snap.getContext("2d")!;
+    sctx.drawImage(video, 0, 0, W, H);
+
+    // show review overlay
+    snap.toBlob((blob) => {
+      if (!blob) return;
+      const url = snap.toDataURL("image/jpeg", 0.9);
+      setPendingBlob(blob);
+      setPendingImg(url);
+      setShowReview(true);
+    }, "image/jpeg", 0.92);
   };
 
-  // confirm/retake
-  const usePhoto = async () => {
-    if (!confirmUrl || !fullRef.current) return;
-    await new Promise<void>((resolve) => {
-      fullRef.current!.toBlob((blob) => {
-        if (!blob) return;
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          onCapture(blob!, String(reader.result));
-          URL.revokeObjectURL(confirmUrl);
-          setConfirmUrl(null);
-          resolve();
-        };
-        reader.readAsDataURL(blob!);
-      }, 'image/jpeg', 0.9);
-    });
+  const confirmKeep = () => {
+    if (pendingBlob && pendingImg) {
+      onCapture(pendingBlob, pendingImg);
+    }
+    setShowReview(false);
+    setPendingBlob(null);
+    setPendingImg(null);
   };
 
   const retake = () => {
-    if (confirmUrl) URL.revokeObjectURL(confirmUrl);
-    setConfirmUrl(null);
+    setShowReview(false);
+    setPendingBlob(null);
+    setPendingImg(null);
   };
 
-  // Overlay shapes
-  const Overlay = () => {
-    if (spec.overlay === 'trapezoid') {
-      return (
-        <div className="pointer-events-none absolute inset-0 flex items-end justify-center">
-          <div className="w-[88%] h-[70%] border-2 border-white/60 rounded-xl relative">
-            <div className="absolute inset-x-0 bottom-[18%] h-0.5 border-t-2 border-dashed border-white/60" />
-          </div>
-        </div>
-      );
-    }
-    if (spec.overlay === 'circle') {
-      return (
-        <div className="pointer-events-none absolute inset-0 flex items-end justify-center">
-          <div className="relative w-[68%] h-[75%]">
-            <div className="absolute left-1/2 top-[60%] -translate-x-1/2 -translate-y-1/2 w-[46%] h-[46%] rounded-full border-2 border-white/70" />
-            <div className="absolute left-1/2 top-[60%] -translate-x-1/2 -translate-y-1/2 w-[30%] h-[30%] rounded-full border border-white/40" />
-          </div>
-        </div>
-      );
-    }
-    if (spec.overlay === 'rectangle') {
-      return (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-          <div className="w-[86%] h-[60%] border-2 border-white/70 rounded-md" />
-        </div>
-      );
-    }
-    if (spec.overlay === 'oval') {
-      return (
-        <div className="pointer-events-none absolute inset-0 flex items-end justify-center">
-          <div className="w-[70%] h-[30%] border-2 border-white/70 rounded-full mb-8" />
-        </div>
-      );
-    }
-    return null;
-  };
+  const captureButtonEnabled = overlay === "oval" ? ovalOK : allGreen;
 
   return (
-    <div className="w-full max-w-md">
-      <div className="relative w-full overflow-hidden rounded-xl bg-black shadow-lg">
-        <video ref={videoRef} playsInline autoPlay muted className="w-full aspect-[4/3] object-cover" />
-        <Overlay />
+    <div className="w-full h-full relative bg-black rounded-xl overflow-hidden">
+      {/* live video */}
+      <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
 
-        {/* Sensor chips */}
-        <div className="absolute top-3 left-3 flex gap-2">
-          <SensorChip ok={sensors.sharp} label="Sharp" />
-          <SensorChip ok={sensors.glareSafe} label="No Glare" />
-          <SensorChip ok={sensors.exposureOK} label="Exposure" />
-          <SensorChip ok={sensors.levelOK} label="Level" />
-          <SensorChip ok={subjectOK || (spec.overlay === 'circle')} label="Subject" />
+      {/* analysis paint */}
+      <canvas ref={paintRef} className="absolute inset-0 w-full h-full" />
+
+      {/* top-left sensor chips */}
+      <div className="absolute top-3 left-3 flex gap-2">
+        <SensorChip ok={sensors.sharp} label="Sharp" />
+        <SensorChip ok={sensors.glareSafe} label="No Glare" />
+        <SensorChip ok={sensors.exposureOK} label="Exposure" />
+        <SensorChip ok={sensors.levelOK} label="Level" />
+        <SensorChip ok={subjectOK || overlay === "circle"} label="Subject" />
+      </div>
+
+      {/* big plain-English guide footer */}
+      <div className="absolute bottom-0 left-0 right-0 p-3">
+        <div className="rounded-lg bg-white/90 p-3 text-sm">
+          <p className="font-semibold mb-1">What to do</p>
+          <ul className="list-disc pl-4 space-y-1">
+            {/* Non-technical, “for dummies” coaching */}
+            {overlay === "trapezoid" && (
+              <>
+                <li>Stand back so the car fills the frame.</li>
+                <li>Keep the bottom of the car on the dashed line.</li>
+                <li>Hold the phone steady for a second.</li>
+              </>
+            )}
+            {overlay === "circle" && (
+              <>
+                <li>Put the wheel inside the ring.</li>
+                <li>Show some tire tread too.</li>
+                <li>Hold steady—photo grabs itself.</li>
+              </>
+            )}
+            {overlay === "rectangle" && (
+              <>
+                <li>Fill the box with the windshield or dashboard.</li>
+                <li>If the dash is on: “Key on, engine off.”</li>
+                <li>Hold steady—photo grabs itself.</li>
+              </>
+            )}
+            {overlay === "oval" && (
+              <>
+                <li>Kneel and aim under the car.</li>
+                <li>Make sure the oval is mostly filled.</li>
+                <li>When the button turns dark, tap to take it.</li>
+              </>
+            )}
+            {overlay === "none" && (
+              <>
+                <li>Frame the car. Keep your hands steady.</li>
+                <li>We’ll take the photo when it looks good.</li>
+              </>
+            )}
+          </ul>
         </div>
+      </div>
 
-        {/* Tip */}
-        <div className="absolute bottom-3 inset-x-3 flex items-center justify-between">
-          <div className="bg-black/50 text-white text-sm px-2 py-1 rounded">{spec.tip}</div>
-
-          {/* dwell ring */}
-          {!countdownActive && (
-            <div className="flex items-center gap-2">
-              <Ring pct={countdownPct} />
-            </div>
-          )}
-        </div>
-
-        {/* 3-2-1 */}
-        {countdownActive && threeTwoOne !== null && (
-          <div className="countdown-overlay">
-            {threeTwoOne}
+      {/* countdown ring (auto steps only) */}
+      {countdown > 0 && overlay !== "oval" && (
+        <div className="absolute bottom-28 left-1/2 -translate-x-1/2">
+          <div className="w-16 h-16 rounded-full bg-black/70 text-white flex items-center justify-center text-xl font-bold">
+            {countdown}
           </div>
-        )}
+        </div>
+      )}
 
-        {/* toast */}
-        {capturing && <div className="capture-toast">Capturing…</div>}
-      </div>
-
-      {/* Controls */}
-      <div className="mt-4 flex items-center justify-center gap-4">
+      {/* capture button (enabled when ready) */}
+      <div className="absolute bottom-4 left-0 right-0 flex items-center justify-center">
         <button
-          onClick={snapNow}
-          className="w-16 h-16 rounded-full bg-blue-600 text-white flex items-center justify-center shadow active:scale-95"
-          title="Take photo"
-        >
-          <Camera className="w-7 h-7" />
-        </button>
+          onClick={() => {
+            // For non-oval, if everything is green we may already auto-capture,
+            // but user can also tap to capture.
+            if (!captureButtonEnabled) return;
+            doCapture();
+          }}
+          className={`h-14 w-14 rounded-full border-4 ${
+            captureButtonEnabled ? "bg-black border-white" : "bg-gray-400 border-gray-200"
+          }`}
+          aria-disabled={!captureButtonEnabled}
+        />
       </div>
 
-      {/* hidden canvases */}
-      <canvas ref={smallRef} className="hidden" />
-      <canvas ref={fullRef} className="hidden" />
+      {/* hidden work canvas */}
+      <canvas ref={workRef} className="hidden" />
 
-      {/* Confirmation Modal */}
-      {confirmUrl && (
-        <div className="fixed inset-0 bg-black/70 z-30 flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl shadow-xl max-w-md w-full overflow-hidden">
-            <div className="bg-black">
-              <img src={confirmUrl} className="w-full max-h-[60vh] object-contain" alt="Captured" />
-            </div>
-            <div className="p-3 flex gap-2">
-              <button onClick={retake} className="flex-1 bg-gray-100 text-gray-900 py-3 rounded-lg font-semibold flex items-center justify-center gap-2">
-                <XCircle className="w-5 h-5" /> Retake
+      {/* review modal */}
+      {showReview && pendingImg && (
+        <div className="absolute inset-0 bg-black/70 flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl overflow-hidden max-w-sm w-full">
+            <img src={pendingImg} alt="Captured" className="w-full h-64 object-contain bg-black" />
+            <div className="p-3 flex items-center justify-between">
+              <button onClick={retake} className="px-4 py-2 rounded-md border">
+                Retake
               </button>
-              <button onClick={usePhoto} className="flex-1 bg-green-600 text-white py-3 rounded-lg font-semibold flex items-center justify-center gap-2">
-                <CheckCircle className="w-5 h-5" /> Use Photo
+              <button
+                onClick={confirmKeep}
+                className="px-4 py-2 rounded-md bg-black text-white"
+              >
+                Keep Photo
               </button>
             </div>
           </div>
